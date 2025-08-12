@@ -82,16 +82,17 @@ def process_file(file_path: str) -> pd.DataFrame:
     for comp, data in company_mentions.items():
         crm = data['crm_data']
         rows.append({
+            '#': crm['#'] if crm is not None else '',
             'Компания': comp,
             'Количество упоминаний': data['count'],
-            'Ссылки на посты': ', '.join(dict.fromkeys(data['links'])),  # уникализация с сохранением порядка
+            'Ссылки на посты': ', '.join(dict.fromkeys(data['links'])),
             'Ответственный Ивенты': crm['Ответственный ДК'] if (crm is not None and 'Ответственный ДК' in crm) else '',
             'Ответственный Медиа': crm['Ответственный Media'] if (crm is not None and 'Ответственный Media' in crm) else '',
             'Работаем ли': 'Да' if crm is not None else 'Нет',
         })
 
     cols = [
-        'Компания', 'Количество упоминаний', 'Ссылки на посты',
+        '#', 'Компания', 'Количество упоминаний', 'Ссылки на посты',
         'Ответственный Ивенты', 'Ответственный Медиа', 'Работаем ли'
     ]
     return pd.DataFrame(rows, columns=cols).sort_values(
