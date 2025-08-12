@@ -1,7 +1,9 @@
+import os
+import re
+
 import pandas as pd
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-import os
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -56,30 +58,63 @@ def process_file(file_path: str) -> pd.DataFrame:
     # Быстрый индекс CRM-строк по полному имени
     crm_index = {row['Полное имя']: row for _, row in df_companies.iterrows()}
 
-    # Подсчёт упоминаний
-    company_mentions = {}
-    for _, row in df_vk.iterrows():
-        text = str(row['GPT']).lower()
-        post_link = row['Ссылка на оригинальный пост (если репост)'] \
-            if row.get('Ссылка на оригинальный пост (если репост)') not in (None, '-', '') \
-            else row.get('Группа', '')
+    # Создаем словарь для быстрого поиска компаний
+    company_map = {}
+    crm_data_map = {}
 
-        for _, crow in df_companies.iterrows():
-            comp = crow['Полное имя']
-            aka = crow['Also known as (AKA)']
-            if (comp and comp in text) or (aka and aka in text):
-                key = comp or aka
-                entry = company_mentions.setdefault(
-                    key,
-                    {'count': 0, 'links': [], 'crm_data': crm_index.get(comp)}
-                )
-                entry['count'] += 1
-                if post_link:
-                    entry['links'].append(str(post_link))
+    for _, row in df_companies.iterrows():
+        company = row['Полное имя']
+        if company:
+            # Сопоставление компании с её данными
+            crm_data_map[company] = row
+
+            # Добавляем основное имя компании
+            company_map[company] = company
+
+            # Добавляем альтернативные названия
+            akas = str(row['Also known as (AKA)']).split(',')
+            for aka in akas:
+                aka = aka.strip()
+                if aka:
+                    company_map[aka] = company
+
+    # Создаем regex-паттерн для поиска всех компаний
+    all_keywords = sorted(company_map.keys(), key=len, reverse=True)
+    pattern = re.compile("|".join(map(re.escape, all_keywords))) if all_keywords else None
+
+    # Словарь для подсчета упоминаний
+    mentions = {}
+
+    for _, row in df_vk.iterrows():
+        text = str(row.get('GPT', '')).lower()
+        post_link = row.get('Ссылка на оригинальный пост (если репост)', '')
+        post_link = post_link if post_link not in (None, '-', '') else row.get('Группа', '')
+
+        found_companies = set()
+
+        if pattern:
+            # Находим все упоминания за один проход
+            matches = pattern.findall(text)
+            for match in matches:
+                company = company_map.get(match)
+                if company:
+                    found_companies.add(company)
+
+        # Обновляем счетчики для найденных компаний
+        for company in found_companies:
+            if company not in mentions:
+                mentions[company] = {
+                    'count': 0,
+                    'links': set(),
+                    'crm_data': crm_data_map.get(company)
+                }
+            mentions[company]['count'] += 1
+            if post_link:
+                mentions[company]['links'].add(str(post_link))
 
     # Сбор итоговой таблицы без .append
     rows = []
-    for comp, data in company_mentions.items():
+    for comp, data in mentions.items():
         crm = data['crm_data']
         rows.append({
             '#': crm['#'] if crm is not None else '',
@@ -91,6 +126,7 @@ def process_file(file_path: str) -> pd.DataFrame:
             'Работаем ли': 'Да' if crm is not None else 'Нет',
         })
 
+    # Сортируем по количеству упоминаний
     cols = [
         '#', 'Компания', 'Количество упоминаний', 'Ссылки на посты',
         'Ответственный Ивенты', 'Ответственный Медиа', 'Работаем ли'
@@ -98,7 +134,6 @@ def process_file(file_path: str) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=cols).sort_values(
         by='Количество упоминаний', ascending=False
     ).reset_index(drop=True)
-
 
 
 def main():
