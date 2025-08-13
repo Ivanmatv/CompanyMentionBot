@@ -42,97 +42,128 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Ошибка при обработке файла: {e}")
 
 
+# ---------- helpers ----------
+def _norm(s: str) -> str:
+    if pd.isna(s): return ""
+    s = str(s).replace("ё", "е").strip().lower()
+    s = re.sub(r"\s+", " ", s).strip("«»\"'()[]")
+    return s
+
+
+def _split_gpt(cell: str) -> list[str]:
+    if pd.isna(cell): return []
+    text = str(cell)
+    rhs = text.split(":", 1)[1] if ":" in text else text
+    parts = re.split(r"[;,•/|—\-–\n\.]", rhs)
+    out = []
+    for p in parts:
+        p = _norm(p)
+        if p:
+            out.append(p)
+    return out
+
+
+def _build_index(df_vpr: pd.DataFrame):
+    alias2canon = {}
+    canon2crm = {}
+    for _, row in df_vpr.iterrows():
+        full = _norm(row.get("Полное имя", ""))
+        if not full:
+            continue
+        canon2crm[full] = row.to_dict()
+        alias2canon[full] = full
+        aka = row.get("Also known as (AKA)", "")
+        if not pd.isna(aka):
+            for t in str(aka).split(","):
+                a = _norm(t)
+                if a:
+                    alias2canon[a] = full
+
+    keep2 = {k for k in canon2crm.keys() if len(k) == 2}
+    drop = set()
+    for a in list(alias2canon.keys()):
+        if a in {",", ".", "-", "–", "—", "/", "|"}: drop.add(a)
+        if a in {"vk", "вк"}: drop.add(a)
+        if len(a) <= 2 and a not in keep2: drop.add(a)
+    for a in drop: alias2canon.pop(a, None)
+    return alias2canon, canon2crm
+
+
+_GENERIC_STOP = {
+    "стажировка", "вакансия", "практика", "кафедра", "факультет", "центр", "департамент", "управление",
+    "гк", "ооо", "зао", "пао", "ао", "ao", "pjsc", "llc", "inc", "corp", "co", "gmbh",
+    "компания", "университет", "институт", "колледж", "академия", "лаборатория", "школа", "обучение",
+    "работа", "карьера", "команда", "проект", "приглашает", "ищет", "набор"
+}
+
+
+def _is_valid_free_token(tok: str) -> bool:
+    if not tok:
+        return False
+    if tok in {"vk", "вк", "vk.com"}:
+        return False
+    if tok.isdigit():
+        return False
+    if len(tok) <= 2:
+        return False
+    if tok in _GENERIC_STOP:
+        return False
+    tok2 = re.sub(r"\b(ооо|ао|пао|зао|ao|pjsc|llc|inc|co|corp|gmbh)\b\.?", "", tok).strip()
+    return bool(tok2)
+
+
 def process_file(file_path: str) -> pd.DataFrame:
     xls = pd.ExcelFile(file_path)
-    df_vk = pd.read_excel(xls, sheet_name='vk')
-    df_companies = pd.read_excel(xls, sheet_name='для ВПР')
+    df_vk = pd.read_excel(xls, sheet_name="vk")
+    df_comp = pd.read_excel(xls, sheet_name="для ВПР")
 
-    # Нормализация справочника компаний
-    df_companies['Полное имя'] = (
-        df_companies['Полное имя'].astype(str).str.lower().str.strip().replace('nan', '')
-    )
-    df_companies['Also known as (AKA)'] = (
-        df_companies['Also known as (AKA)'].astype(str).str.lower().str.strip().replace('nan', '')
-    )
+    alias2canon, canon2crm = _build_index(df_comp)
+    canon_names = set(canon2crm.keys())
 
-    # Быстрый индекс CRM-строк по полному имени
-    crm_index = {row['Полное имя']: row for _, row in df_companies.iterrows()}
-
-    # Создаем словарь для быстрого поиска компаний
-    company_map = {}
-    crm_data_map = {}
-
-    for _, row in df_companies.iterrows():
-        company = row['Полное имя']
-        if company:
-            # Сопоставление компании с её данными
-            crm_data_map[company] = row
-
-            # Добавляем основное имя компании
-            company_map[company] = company
-
-            # Добавляем альтернативные названия
-            akas = str(row['Also known as (AKA)']).split(',')
-            for aka in akas:
-                aka = aka.strip()
-                if aka:
-                    company_map[aka] = company
-
-    # Создаем regex-паттерн для поиска всех компаний
-    all_keywords = sorted(company_map.keys(), key=len, reverse=True)
-    pattern = re.compile("|".join(map(re.escape, all_keywords))) if all_keywords else None
-
-    # Словарь для подсчета упоминаний
     mentions = {}
-
     for _, row in df_vk.iterrows():
-        text = str(row.get('GPT', '')).lower()
-        post_link = row.get('Ссылка на оригинальный пост (если репост)', '')
-        post_link = post_link if post_link not in (None, '-', '') else row.get('Группа', '')
+        post_link = row.get("Пост")
+        if pd.isna(post_link) or not str(post_link).strip():
+            post_link = row.get("Группа", "")
 
-        found_companies = set()
+        candidates = _split_gpt(row.get("GPT", ""))
 
-        if pattern:
-            # Находим все упоминания за один проход
-            matches = pattern.findall(text)
-            for match in matches:
-                company = company_map.get(match)
-                if company:
-                    found_companies.add(company)
+        found = set()
+        for c in candidates:
+            if c in alias2canon:
+                found.add(alias2canon[c]); continue
+            c2 = re.sub(r"\b(ооо|ао|пао|зао|ao|pjsc|llc|inc|co|corp|gmbh)\b\.?", "", c).strip()
+            if c2 in alias2canon:
+                found.add(alias2canon[c2]); continue
+            # Новое: добавляем "свободную" компанию, если токен выглядит валидным
+            if _is_valid_free_token(c):
+                found.add(c)
 
-        # Обновляем счетчики для найденных компаний
-        for company in found_companies:
-            if company not in mentions:
-                mentions[company] = {
-                    'count': 0,
-                    'links': set(),
-                    'crm_data': crm_data_map.get(company)
-                }
-            mentions[company]['count'] += 1
-            if post_link:
-                mentions[company]['links'].add(str(post_link))
+        for comp in found:
+            crm = canon2crm.get(comp) if comp in canon_names else None
+            if comp not in mentions:
+                mentions[comp] = {"count": 0, "links": [], "crm": crm}
+            mentions[comp]["count"] += 1
+            if post_link and str(post_link) not in mentions[comp]["links"]:
+                mentions[comp]["links"].append(str(post_link))
 
-    # Сбор итоговой таблицы без .append
     rows = []
     for comp, data in mentions.items():
-        crm = data['crm_data']
+        crm = data["crm"]
         rows.append({
-            '#': crm['#'] if crm is not None else '',
-            'Компания': comp,
-            'Количество упоминаний': data['count'],
-            'Ссылки на посты': ', '.join(dict.fromkeys(data['links'])),
-            'Ответственный Ивенты': crm['Ответственный ДК'] if (crm is not None and 'Ответственный ДК' in crm) else '',
-            'Ответственный Медиа': crm['Ответственный Media'] if (crm is not None and 'Ответственный Media' in crm) else '',
-            'Работаем ли': 'Да' if crm is not None else 'Нет',
+            "#": crm.get("#") if crm else "",
+            "Компания": comp,
+            "Количество упоминаний": data["count"],
+            "Ссылки на посты": ", ".join(data["links"]),
+            "Ответственный Ивенты": crm.get("Ответственный ДК") if crm else "",
+            "Ответственный Медиа": crm.get("Ответственный Media") if crm else "",
+            "Работаем ли": "Да" if comp in canon_names else "Нет",
         })
 
-    # Сортируем по количеству упоминаний
-    cols = [
-        '#', 'Компания', 'Количество упоминаний', 'Ссылки на посты',
-        'Ответственный Ивенты', 'Ответственный Медиа', 'Работаем ли'
-    ]
+    cols = ["#", "Компания", "Количество упоминаний", "Ссылки на посты",
+            "Ответственный Ивенты", "Ответственный Медиа", "Работаем ли"]
     return pd.DataFrame(rows, columns=cols).sort_values(
-        by='Количество упоминаний', ascending=False
+        by="Количество упоминаний", ascending=False
     ).reset_index(drop=True)
 
 
