@@ -21,3 +21,5 @@ tornado==6.5.2
 typing_extensions==4.14.1
 tzdata==2025.2
 tzlocal==5.3.1
+gspread
+google-auth
