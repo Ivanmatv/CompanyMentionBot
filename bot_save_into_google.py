@@ -16,7 +16,7 @@ logger = get_logger()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GOOGLE_SHEET_KEY = os.getenv("GOOGLE_SHEET_KEY")
-GOOGLE_SHEET = os.getenv("GOOGLE_SHEET")
+GOOGLE_CRM_SHEET_NAME = os.getenv("GOOGLE_CRM_SHEET_NAME", "СРМ")  # Название листа с CRM данными
 CREDENTIALS_FILE = "credentials.json"
 DATA_DIRECTORY = 'data'
 
@@ -91,6 +91,7 @@ def is_valid_company_name(company_name: str) -> bool:
     # Исключаем чисто числовые значения
     if company_name.isdigit():
         return False
+
     # Исключаем слишком короткие названия
     if len(company_name) <= 2:
         return False
@@ -106,6 +107,47 @@ def is_valid_company_name(company_name: str) -> bool:
     return bool(name_without_legal_form)
 
 
+def get_google_sheet_client():
+    """Создает и возвращает клиент для работы с Google Sheets"""
+    try:
+        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
+        client = gspread.authorize(creds)
+        logger.info("Успешное подключение к Google Sheets")
+        return client
+    except Exception as e:
+        logger.error(f"Ошибка подключения к Google Sheets: {str(e)}")
+        raise
+
+
+def load_crm_data_from_google_sheet() -> pd.DataFrame:
+    """
+    Загружает данные CRM из Google Таблицы
+    Returns: DataFrame с данными компаний
+    """
+    logger.info(f"Загрузка данных CRM из Google Таблицы, лист: {GOOGLE_CRM_SHEET_NAME}")
+    
+    try:
+        client = get_google_sheet_client()
+        spreadsheet = client.open_by_key(GOOGLE_SHEET_KEY)
+        
+        # Получаем лист с CRM данными
+        worksheet = spreadsheet.worksheet(GOOGLE_CRM_SHEET_NAME)
+        
+        # Получаем все данные
+        data = worksheet.get_all_records()
+        
+        # Преобразуем в DataFrame
+        companies_dataframe = pd.DataFrame(data)
+        
+        logger.info(f"Успешно загружено {len(companies_dataframe)} записей из CRM")
+        return companies_dataframe
+        
+    except Exception as e:
+        logger.error(f"Ошибка загрузки данных CRM из Google Таблицы: {str(e)}")
+        raise
+
+
 def build_company_mappings(companies_dataframe: pd.DataFrame) -> tuple[dict, dict]:
     """
     Создает отображения псевдонимов компаний на канонические названия и канонических названий на данные CRM.
@@ -113,7 +155,7 @@ def build_company_mappings(companies_dataframe: pd.DataFrame) -> tuple[dict, dic
     Returns: Кортеж (alias_to_canonical, canonical_to_crm_data)
     """
     logger.info("Начало построения маппингов компаний")
-    
+
     alias_to_canonical = {}
     canonical_to_crm_data = {}
 
@@ -190,15 +232,18 @@ def process_uploaded_file(file_path: str) -> pd.DataFrame:
     Returns: DataFrame с результатами обработки
     """
     logger.info(f"Начало обработки файла: {file_path}")
-    
+
     try:
+        # Загружаем посты из файла
         excel_data = pd.ExcelFile(file_path)
         posts_dataframe = pd.read_excel(excel_data, sheet_name="vk")
-        companies_dataframe = pd.read_excel(excel_data, sheet_name="для ВПР")
         
-        logger.info(f"Загружено постов: {len(posts_dataframe)}, компаний: {len(companies_dataframe)}")
+        # Загружаем данные CRM из Google Таблицы
+        companies_dataframe = load_crm_data_from_google_sheet()
+
+        logger.info(f"Загружено постов: {len(posts_dataframe)}, компаний из CRM: {len(companies_dataframe)}")
     except Exception as e:
-        logger.error(f"Ошибка загрузки файла {file_path}: {str(e)}")
+        logger.error(f"Ошибка загрузки данных: {str(e)}")
         raise
 
     # Строим маппинги компаний
@@ -234,7 +279,7 @@ def process_uploaded_file(file_path: str) -> pd.DataFrame:
 
             if post_link and str(post_link) not in company_mentions[company]["post_links"]:
                 company_mentions[company]["post_links"].append(str(post_link))
-        
+
         processed_posts += 1
         if processed_posts % 100 == 0:
             logger.info(f"Обработано постов: {processed_posts}/{len(posts_dataframe)}")
@@ -269,26 +314,13 @@ def process_uploaded_file(file_path: str) -> pd.DataFrame:
     return sorted_report.reset_index(drop=True)
 
 
-def get_google_sheet_client():
-    """Создает и возвращает клиент для работы с Google Sheets"""
-    try:
-        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-        creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
-        client = gspread.authorize(creds)
-        logger.info("Успешное подключение к Google Sheets")
-        return client
-    except Exception as e:
-        logger.error(f"Ошибка подключения к Google Sheets: {str(e)}")
-        raise
-
-
 def save_to_google_sheets(dataframe: pd.DataFrame, worksheet_name: str = "Обработанные данные") -> str:
     """
     Сохраняет DataFrame в Google Таблицу на указанный лист
     Returns: Ссылка на таблицу
     """
     logger.info(f"Начало сохранения данных в Google Sheets. Записей: {len(dataframe)}")
-    
+
     try:
         client = get_google_sheet_client()
         spreadsheet = client.open_by_key(GOOGLE_SHEET_KEY)
@@ -341,7 +373,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.info(f"Команда /start от пользователя {update.effective_user.id}")
     welcome_message = (
         "Привет! Отправьте файл с постами для обработки. "
-        "Размер файла не должен превышать 20 МБ"
+        "Размер файла не должен превышать 20 МБ\n\n"
+        "Данные о компаниях загружаются из CRM Google Таблицы."
     )
     await update.message.reply_text(welcome_message)
 
@@ -373,7 +406,8 @@ async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
         success_message = (
             f"✅ Обработка завершена!\n"
             f"📊 Данные сохранены в Google Таблицу на лист 'Обработанные данные':\n"
-            f"{sheet_url}"
+            f"{sheet_url}\n\n"
+            f"Данные компаний загружены из CRM."
         )
 
         await update.message.reply_text(success_message)
